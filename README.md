@@ -1,6 +1,6 @@
 # Intelligent Document Analysis
 
-<img src="images/idp-text.PNG" width="1000"/>
+<img src="images/txt-pic.PNG" width="1000"/>
 
 Intelligent Document Analysis is an innovative AI-powered application designed to revolutionize document processing and analysis in the medical insurance domain. With this solution, insurance claims agents can efficiently summarize documents, extract key information, and provide prompt customer support through an intelligent Q&A interface.
 
