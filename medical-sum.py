@@ -77,6 +77,55 @@ if 'conf' not in st.session_state:
     st.session_state['conf'] = ""
 if 'data_pages' not in st.session_state:
     st.session_state['data_pages'] = 0
+if 'gt' not in st.session_state:
+    st.session_state['gt'] = None
+
+
+import boto3
+import time
+import random
+
+from urllib3.exceptions import IncompleteRead
+
+def get_object_with_retry(bucket, key):
+    max_retries = 5
+    retries = 0   
+    backoff_base = 2
+    max_backoff = 3  # Maximum backoff time in seconds
+    s3 = boto3.client('s3')
+
+    while retries < max_retries:
+        try:
+            response = s3.get_object(Bucket=bucket, Key=key)
+            # Attempt to read the entire content to catch potential IncompleteRead errors
+            # response['Body'].read()
+            # response['Body'].seek(0)  # Reset the stream position
+            return response
+        except ClientError as e:
+            error_code = e.response['Error']['Code']            
+            if error_code == 'DecryptionFailureException':
+                sleep_time = min(max_backoff, backoff_base ** retries + random.uniform(0, 1))
+                print(f"Decryption failed, retrying in {sleep_time} seconds...")                
+                time.sleep(sleep_time)               
+                retries += 1
+            elif error_code == 'ModelStreamErrorException':
+                if retries < max_retries:
+                    sleep_time = min(max_backoff, backoff_base ** retries + random.uniform(0, 1))
+                    time.sleep(sleep_time)
+                    retries += 1
+            else:
+                raise e
+        except IncompleteRead as e:
+            if retries < max_retries:
+                sleep_time = min(max_backoff, backoff_base ** retries + random.uniform(0, 1))
+                print(f"IncompleteRead error, retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
+                retries += 1
+            else:
+                raise Exception(f"Failed to read complete response after {max_retries} attempts: {str(e)}")
+
+    # If we've exhausted all retries
+    raise Exception(f"Failed to retrieve object after {max_retries} attempts")
     
 def put_db(params,messages):
     """Store long term chat history in DynamoDB"""    
@@ -429,7 +478,7 @@ def process_files(files):
                 result_string[doc_name] = result[0]
                 table_string[doc_name] = result[1]
                 st.session_state['data_pages']+=result[2]
-                print(result[2])
+
             except Exception as e:
                 # Get the original function arguments from the Future object
                 error = {'file': file_url, 'error': str(e)}
@@ -441,8 +490,20 @@ def process_files(files):
 def read_json_from_s3(bucket, key):
     import io
     s3_client = boto3.client('s3')
-    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    obj = get_object_with_retry(bucket,key)
     return pd.read_json(io.BytesIO(obj['Body'].read()))
+
+def check_file_exists_in_s3(file, s3_path):
+    file_base_name = os.path.basename(file)
+    txt_file_name = file_base_name + ".txt"
+    json_file_name = file_base_name + ".json"
+
+    s3_keys = get_s3_keys(s3_path)
+
+    txt_exists = any(txt_file_name == x for x in s3_keys)
+    json_exists = any(json_file_name == x for x in s3_keys)
+
+    return txt_exists and json_exists
 
 
 # @st.cache_data
@@ -456,8 +517,8 @@ def get_text_ocr_(file):
     This function first checks if the text extraction result for the given file already exists in an S3 bucket at the specified `TEXTRACT_RESULT_CACHE_PATH`. If the result exists, it retrieves the text from the S3 object and returns it, skipping the text extraction process.
     If the text extraction result doesn't exist, the function proceeds to extract the text from the file using Amazon Textract. It determines the file type (image or PDF) based on the file extension and calls the appropriate Textract method (`analyze_document` for images, `start_document_analysis` for PDFs)."""
     file_base_name=os.path.basename(file)+".txt"
-    if [x for x in get_s3_keys(f"{TEXTRACT_RESULT_CACHE_PATH}/") if file_base_name == x]:     
-        response = S3.get_object(Bucket=BUCKET, Key=f"{TEXTRACT_RESULT_CACHE_PATH}/{file_base_name}")
+    if check_file_exists_in_s3(file, f"{TEXTRACT_RESULT_CACHE_PATH}/"):   
+        response = get_object_with_retry(BUCKET, f"{TEXTRACT_RESULT_CACHE_PATH}/{file_base_name}")
         text = response['Body'].read().decode()
         # response = S3.get_object(Bucket=BUCKET, Key=f"{TEXTRACT_RESULT_CACHE_PATH}/{os.path.basename(file)}.json")
         word_dict=read_json_from_s3(BUCKET, f"{TEXTRACT_RESULT_CACHE_PATH}/{os.path.basename(file)}.json")      
@@ -499,6 +560,7 @@ def get_text_ocr_(file):
             word_dic_save=json.dumps(word_dict)
             
         S3.put_object(Body=word_dic_save, Bucket=BUCKET, Key=f"{TEXTRACT_RESULT_CACHE_PATH}/{doc_id}.json") 
+        time.sleep(1)
         S3.put_object(Body=document.get_text(config=configs), Bucket=BUCKET, Key=f"{TEXTRACT_RESULT_CACHE_PATH}/{doc_id}.txt")   
         # st.session_state['data_pages']+=len(document.pages)
         return document.get_text(config=configs), word_dict, len(document.pages)
@@ -567,54 +629,78 @@ def page_summary(params):
     import time
     pdf_file=""
     item_cache={}
+    json_cache={}
     s3 = boto3.client('s3')
     if params['file_item'] and params["processor"] == "Textract":
         if isinstance(params['file_item'], list):
             st.session_state['mode']='textract'
             doc_list=[]
+            json_list=[]
             if all(isinstance(file, UploadedFile) for file in params['file_item']):
                 for file in params['file_item']:
-                    pdf_name=file.name
-                    pdf_bytes=file.read()
-                    item_cache[pdf_name]=pdf_bytes
-                    s3.put_object(Bucket=BUCKET, Key=f"{PREFIX}/{pdf_name}", Body=pdf_bytes)
-                    doc_list.append(pdf_name)
-                doc_file_names=[f"s3://{BUCKET}/{PREFIX}/{x}" for x in doc_list]           
-                params['file_item'] = doc_file_names
+                    if not (file.name.endswith('.json') or file.name.endswith('.txt')):
+                        pdf_name=file.name
+                        pdf_bytes=file.read()
+                        item_cache[pdf_name]=pdf_bytes
+                        s3.put_object(Bucket=BUCKET, Key=f"{PREFIX}/{pdf_name}", Body=pdf_bytes)
+                        doc_list.append(pdf_name)
+                    else:
+                        json_name=file.name
+                        json_bytes=file.read().decode()
+                 
+                        json_cache[json_name]=json_bytes                   
+                        json_list.append(json_name)
+                if doc_list:
+                    doc_file_names=[f"s3://{BUCKET}/{PREFIX}/{x}" for x in doc_list]           
+                    params['file_processed'] = doc_file_names
+                if json_list:                    
+                    st.session_state['gt']= json_cache
 
     if params['s3_objects'] and params["processor"] == "Textract":
         if isinstance(params['s3_objects'], list):
             st.session_state['mode']='textract'
             doc_list=[]
+            json_list=[]
             if all(isinstance(file, str) for file in params['s3_objects']):
                 for file in params['s3_objects']:
-                    pdf_name=file
-                    # st.write(f"{INPUT_S3_PATH}/{pdf_name}")
-                    pdf_bytes=S3.get_object(Bucket=BUCKET, Key=f"{INPUT_S3_PATH}/{pdf_name}")["Body"].read()
-                    item_cache[pdf_name]=pdf_bytes
-                    # s3.put_object(Bucket=BUCKET, Key=f"{PREFIX}/{pdf_name}", Body=pdf_bytes)
-                    doc_list.append(pdf_name)
-                doc_file_names=[f"s3://{BUCKET}/{INPUT_S3_PATH}/{x}" for x in doc_list]   
-                if params['file_item']:
-                    params['file_item']= params['file_item']+doc_file_names
-                else:
-                    params['file_item']=doc_file_names
-                    
+                    if not (file.endswith('.json') or file.endswith('.txt')):
+                        pdf_name=file
+                        # st.write(f"{INPUT_S3_PATH}/{pdf_name}")
+                        pdf_bytes=get_object_with_retry(BUCKET, f"{INPUT_S3_PATH}/{pdf_name}")["Body"].read()
+                        item_cache[pdf_name]=pdf_bytes                   
+                        doc_list.append(pdf_name)
+                    else:
+                        json_name=file
+                        json_bytes=get_object_with_retry(BUCKET, f"{INPUT_S3_PATH}/{json_name}")["Body"].read().decode()
+                        json_cache[json_name]=json_bytes                   
+                        json_list.append(json_name)
+                if doc_list:
+                    doc_file_names=[f"s3://{BUCKET}/{INPUT_S3_PATH}/{x}" for x in doc_list]   
+                    if 'file_processed' in params and params['file_processed']:
+                        params['file_processed']= params['file_processed']+doc_file_names
+                    else:
+                        params['file_processed']=doc_file_names
+                if json_list:
+                    if st.session_state['gt']:
+                        st.session_state['gt'].update(json_cache)
+                    else:
+                        st.session_state['gt']= json_cache
+                        
     
      
         
-    elif params['file_item'] and params["processor"] == "Claude3":
-        st.session_state['mode']='claude'
-        if isinstance(params['file_item'], list):
-            doc_list=[]
-            if all(isinstance(file, UploadedFile) for file in params['file_item']):
-                for file in params['file_item']:
-                    pdf_name=file.name
-                    pdf_bytes=file.read()
-                    item_cache[pdf_name]=pdf_bytes
-                    s3.put_object(Bucket=BUCKET, Key=f"{PREFIX}/{pdf_name}", Body=pdf_bytes)
-                    doc_list.append(pdf_name) 
-                params['file_item']=doc_list
+    # elif params['file_item'] and params["processor"] == "Claude3":
+    #     st.session_state['mode']='claude'
+    #     if isinstance(params['file_item'], list):
+    #         doc_list=[]
+    #         if all(isinstance(file, UploadedFile) for file in params['file_item']):
+    #             for file in params['file_item']:
+    #                 pdf_name=file.name
+    #                 pdf_bytes=file.read()
+    #                 item_cache[pdf_name]=pdf_bytes
+    #                 s3.put_object(Bucket=BUCKET, Key=f"{PREFIX}/{pdf_name}", Body=pdf_bytes)
+    #                 doc_list.append(pdf_name) 
+    #             params['file_item']=doc_list
    
 
     if  item_cache:
@@ -650,11 +736,12 @@ def page_summary(params):
                     img = Image.open(io.BytesIO(filee)) 
                     st.image(img)
         with colm2:            
-            tab2, tab3, tab4 = st.tabs(["**Extracted Text**", "**QnA**","**Confidence Score**"])
+            tab2, tab3, tab4, tab5 = st.tabs(["**Extracted Text**", "**QnA**","**Confidence Score**", "**Ground Truth**"])
             with tab2.container(height=800,border=False):
                 if st.button('Extract',type="primary",key='summ'): 
-                    results, errors, result_string = process_files(params['file_item'])  
-                    # st.write(errors)
+                    results, errors, result_string = process_files(params['file_processed'])  
+                    if errors:
+                        st.write(errors)
                     st.session_state['page_summ']=result_string 
                     st.session_state['conf'] = results
               
@@ -698,6 +785,18 @@ def page_summary(params):
                         with tabss:                            
                             container_tab_2=st.empty()                            
                             container_tab_2.dataframe(st.session_state['conf'][file_list[ids]])
+            with tab5.container(height=1000,border=False):        
+                if st.session_state['gt']: 
+                    json_list = list(st.session_state['gt'].keys())
+                    tab_object_2 = st.tabs([f"**{x}**" for x in st.session_state['gt']])
+                    for idss,tabsss in enumerate(tab_object_2):                        
+                        with tabsss:                            
+                            container_tab_3=st.empty()            
+                            try:
+                                file_cont=json.loads(st.session_state['gt'][json_list[idss]])
+                            except:
+                                file_cont=st.session_state['gt'][json_list[idss]]
+                            container_tab_3.write(file_cont)
     else:
         st.session_state['conf'] = ""
         st.session_state['page_summ'] = ""      
@@ -762,7 +861,7 @@ def app_sidebar():
             process_images=st.selectbox("**Document Processor**",["Textract"],key="processor")
         else:
             process_images="Textract"
-        uploaded_files = st.file_uploader("Upload PDF or image files", type=["pdf", "png", "jpg", "jpeg","tif"], accept_multiple_files=True)
+        uploaded_files = st.file_uploader("Upload PDF or image files", type=["pdf", "png", "jpg", "jpeg","tif","json","txt"], accept_multiple_files=True)
         params={"model":model, "session_id":session_id, "chat_item":chat_items,"file_item":uploaded_files, "processor":process_images,'s3_objects':bucket_objects }
         return params
 
