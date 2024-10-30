@@ -1,0 +1,8 @@
+streamlit
+boto3
+pymupdf
+pandas
+amazon-textract-textractor==1.7.1
+s3fs
+openpyxl
+reportlab
