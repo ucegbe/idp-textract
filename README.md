@@ -27,7 +27,7 @@ Set up the necessary cloud services:
 * [Create a JupyterLab space](https://docs.aws.amazon.com/sagemaker/latest/dg/studio-updated-jl.html)
 * <img src="images/JP-lab.PNG" width="600"/>
 * Open a terminal by clicking **File** -> **New** -> **Terminal**
-* Navigate into the cloned repository directory using the `cd bedrock-claude-chatbot` command and run the following commands to install the application python libraries:
+* Navigate into the cloned repository directory using the `cd idp-textract` command and run the following commands to install the application python libraries:
   - sudo apt update
   - sudo apt upgrade -y
   - chmod +x install_package.sh
