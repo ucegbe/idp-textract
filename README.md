@@ -33,7 +33,10 @@ Set up the necessary cloud services:
    ```
 5. Open a system terminal by clicking on **Amazon SageMaker Studio** and then **System Terminal** as shown in the diagram below
 * <img src="images/studio-new-launcher.png" width="600"/>
-6. Navigate into the cloned repository directory using the `cd` command and run the command `pip install -r req.txt` to install the needed python libraries
+6. Navigate into the cloned repository directory using the `cd` command and run the following command to install the python libraries.
+   - chmod +x install_package.sh
+   - ./install_package.sh
+**NOTE**: If you run into package installation errors, try installing the packages manually one by one
 7. Configure the application:
    - Update the `config.json` file with your preferences.
        - `DynamodbTable`: The name of the DynamoDB table used for storing chat history.
