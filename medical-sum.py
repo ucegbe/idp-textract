@@ -1,13 +1,10 @@
 import boto3
 from botocore.config import Config
-import shutil
 import os
 import fitz
 from textractor import Textractor
-from textractor.visualizers.entitylist import EntityList
 from textractor.data.constants import TextractFeatures
 from PIL import Image
-from io import BytesIO
 import io
 import pandas as pd
 from botocore.exceptions import ClientError
@@ -29,6 +26,11 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 import concurrent.futures
 from functools import partial
+import random
+from urllib3.exceptions import IncompleteRead
+
+
+
 # Read credentials
 with open('config.json') as f:
     config_file = json.load(f)
@@ -51,7 +53,7 @@ INPUT_EXT=tuple(f".{x}" for x in config_file["input_file_ext"].split(','))
 INPUT_BUCKET=config_file["Bucket_Name"]
 INPUT_S3_PATH=config_file["input_s3_path"]
 
-st.set_page_config(layout="wide",initial_sidebar_state="collapsed")
+st.set_page_config(layout="wide")
 
 if 'messages' not in st.session_state:
     st.session_state['messages'] = []
@@ -64,7 +66,7 @@ if 'page_summ' not in st.session_state:
 if 'extraction' not in st.session_state:
     st.session_state['extraction'] = ""
 if 'user_sess' not in st.session_state:
-    st.session_state['user_sess'] = f"richie-{str(time.time()).split('.')[0]}"
+    st.session_state['user_sess'] = f"{str(time.time()).split('.')[0]}"
 if 'userid' not in st.session_state:
     st.session_state['userid']= config_file["UserId"]
 if 'cost' not in st.session_state:
@@ -79,13 +81,11 @@ if 'data_pages' not in st.session_state:
     st.session_state['data_pages'] = 0
 if 'gt' not in st.session_state:
     st.session_state['gt'] = None
+if 'editor_box' not in st.session_state:
+    st.session_state['editor_box'] = None
 
+SESSIONID = st.session_state['user_sess']
 
-import boto3
-import time
-import random
-
-from urllib3.exceptions import IncompleteRead
 
 def get_object_with_retry(bucket, key):
     max_retries = 5
@@ -147,38 +147,62 @@ def put_db(params,messages):
 
 def get_chat_history_db(params,cutoff):
     current_chat, chat_hist=[],[]
-    if "Item" in params['chat_histories']:  
-        chat_hist=params['chat_histories']['Item']['messages'][-cutoff:]            
-        for d in chat_hist:            
-            current_chat.append({'role': 'user', 'content': [{"type":"text","text":d['user']}]})
-            current_chat.append({'role': 'assistant', 'content': d['assistant']})  
+    if DYNAMODB_TABLE:
+        if "Item" in params['chat_histories']:  
+            chat_hist=params['chat_histories']['Item']['messages'][-cutoff:]            
+            for d in chat_hist:            
+                current_chat.append({'role': 'user', 'content': [{"type":"text","text":d['user']}]})
+                current_chat.append({'role': 'assistant', 'content': d['assistant']})  
+        else:
+            chat_hist=[]
     else:
-        chat_hist=[]
+        if params['chat_histories']:
+            chat_hist = params['chat_histories'][-cutoff:]    
+            for d in chat_hist:            
+                    current_chat.append({'role': 'user', 'content': [{"type":"text","text":d['user']}]})
+                    current_chat.append({'role': 'assistant', 'content': d['assistant']})
+        else:
+            chat_hist = []
     return current_chat, chat_hist
     
 def get_session_ids_by_user(table_name, user_id):
     """
     Get Session Ids and corresponding top message for a user to populate the chat history drop down on the front end
     """
-    table = DYNAMODB.Table(table_name)
     message_list={}
     session_ids = []
-    args = {
-        'KeyConditionExpression': Key('UserId').eq(user_id)
-    }
-    while True:
-        response = table.query(**args)
-        session_ids.extend([item['SessionId'] for item in response['Items']])
-        if 'LastEvaluatedKey' not in response:
-            break
-        args['ExclusiveStartKey'] = response['LastEvaluatedKey']
+    if DYNAMODB_TABLE:
+        table = DYNAMODB.Table(table_name)
         
-    for session_id in session_ids:
+        args = {
+            'KeyConditionExpression': Key('UserId').eq(user_id)
+        }
+        while True:
+            response = table.query(**args)
+            session_ids.extend([item['SessionId'] for item in response['Items']])
+            if 'LastEvaluatedKey' not in response:
+                break
+            args['ExclusiveStartKey'] = response['LastEvaluatedKey']
+            
+        for session_id in session_ids:
+            try:
+                message_list[session_id]=DYNAMODB.Table(table_name).get_item(Key={"UserId": user_id, "SessionId":session_id})['Item']['messages'][0]['user']
+            except Exception as e:
+                print(e)
+                pass
+
+    else:
         try:
-            message_list[session_id]=DYNAMODB.Table(table_name).get_item(Key={"UserId": user_id, "SessionId":session_id})['Item']['messages'][0]['user']
-        except Exception as e:
-            print(e)
-            pass
+            message_list={}
+            # Read the existing JSON data from the file
+            with open("chat_history.json", "r", encoding='utf-8') as file:
+                existing_data = json.load(file)
+            for session_id in existing_data:
+                message_list[session_id]=existing_data[session_id][0]['user']
+            
+        except FileNotFoundError:
+            # If the file doesn't exist, initialize an empty list
+            message_list = {}
     return message_list
 
 
@@ -284,11 +308,14 @@ def query_llm(params, handler):
     image_path=[]
     claude3=False
     model='anthropic.'+params['model']
-    if "sonnet" in model or "haiku" in model:
-        model+="-20240620-v1:0" if "claude-3-5" in model else  "-20240307-v1:0" if "haiku" in model else "-20240229-v1:0"
+    if "sonnet" in model or "haiku" or "opus" in model:
+        model+="-20240620-v1:0" if "claude-3-5" in model else  "-20240307-v1:0" if "haiku" in model else "-20240229-v1:0" if "opus" in model else "-20240229-v1:0"
         claude3=True
     # Retrieve past chat history from Dynamodb 
+
     current_chat,chat_hist=get_chat_history_db(params, CHAT_HISTORY_LENGTH)
+
+                
     with open("prompt/chat.txt","r") as f:
         system_template=f.read()
     if "doc" in params:
@@ -307,10 +334,11 @@ def query_llm(params, handler):
     #store convsation memory in DynamoDB table
     if DYNAMODB_TABLE:
         put_db(params,chat_history)
+    else: 
+        save_chat_local("chat_history.json",[chat_history])
     return response
     
-def extractor_llm(params, handler):
-    import json       
+def extractor_llm(params, handler):  
     current_chat=[]
     image_path=[]
     claude3=False
@@ -409,21 +437,38 @@ def get_chat_historie_for_streamlit(params):
     """
     This function retrieves chat history stored in a dynamoDB table partitioned by a userID and sorted by a SessionID
     """
-    chat_histories = DYNAMODB.Table(DYNAMODB_TABLE).get_item(Key={"UserId": st.session_state['userid'], "SessionId":params["session_id"]})
-# Constructing the desired list of dictionaries
-    formatted_data = []
-    if 'Item' in chat_histories:
-        for entry in chat_histories['Item']['messages']:
-            formatted_data.append({
-                "role": "user",
-                "content": entry["user"],
-            })
-            formatted_data.append({
-                "role": "assistant",
-                "content": entry["assistant"], 
-            })
+    if DYNAMODB_TABLE:
+        chat_histories = DYNAMODB.Table(DYNAMODB_TABLE).get_item(Key={"UserId": st.session_state['userid'], "SessionId":params["session_id"]})
+    # Constructing the desired list of dictionaries
+        formatted_data = []
+        if 'Item' in chat_histories:
+            for entry in chat_histories['Item']['messages']:
+                formatted_data.append({
+                    "role": "user",
+                    "content": entry["user"],
+                })
+                formatted_data.append({
+                    "role": "assistant",
+                    "content": entry["assistant"], 
+                })
+        else:
+            chat_histories=[]           
     else:
-        chat_histories=[]            
+        chat_histories=load_chat_local("chat_history.json")   
+        # Constructing the desired list of dictionaries
+        formatted_data = []
+        if chat_histories:
+            for entry in chat_histories:
+                formatted_data.append({
+                    "role": "user",
+                    "content": entry["user"],
+                })
+                formatted_data.append({
+                    "role": "assistant",
+                    "content": entry["assistant"], 
+                })
+        else:
+            chat_histories=[]       
     return formatted_data,chat_histories
 
 def get_key_from_value(dictionary, value):
@@ -564,6 +609,42 @@ def get_text_ocr_(file):
         S3.put_object(Body=document.get_text(config=configs), Bucket=BUCKET, Key=f"{TEXTRACT_RESULT_CACHE_PATH}/{doc_id}.txt")   
         # st.session_state['data_pages']+=len(document.pages)
         return document.get_text(config=configs), word_dict, len(document.pages)
+
+
+def save_chat_local(file_path, new_data):
+    """Store long term chat history Local Disk"""   
+    try:
+        # Read the existing JSON data from the file
+        with open(file_path, "r",encoding='utf-8') as file:
+            existing_data = json.load(file)
+        if SESSIONID not in existing_data:
+            existing_data[SESSIONID]=[]
+    except FileNotFoundError:
+        # If the file doesn't exist, initialize an empty list
+        existing_data = {SESSIONID:[]}
+    # Append the new data to the existing list
+    from decimal import Decimal
+    data = [{k: float(v) if isinstance(v, Decimal) else v for k, v in item.items()} for item in new_data]
+    existing_data[SESSIONID].extend(data)
+    # Write the updated list back to the JSON file
+    with open(file_path, "w") as file:
+        json.dump(existing_data, file)
+        
+def load_chat_local(file_path):
+    """Load long term chat history from Local"""   
+    try:
+        # Read the existing JSON data from the file
+        with open(file_path, "r",encoding='utf-8') as file:
+            existing_data = json.load(file)
+            if SESSIONID in existing_data:
+                existing_data=existing_data[SESSIONID]
+            else:
+                existing_data=[]
+    except FileNotFoundError:
+        # If the file doesn't exist, initialize an empty list
+        existing_data = []
+    return existing_data
+
 
 def is_pdf(file_bytes):
     """
@@ -749,15 +830,27 @@ def page_summary(params):
                     # st.write(st.session_state['page_summ'].keys())
                     file_list = list(st.session_state['page_summ'].keys())
                     tab_objects = st.tabs([f"**{x}**" for x in st.session_state['page_summ']])
-                    for ids,tabs in enumerate(tab_objects):                        
+                    
+                    for ids,tabs in enumerate(tab_objects):  
+                        # st.write(tabs)
                         with tabs:                            
                             container_tab=st.empty()                            
                             container_tab.markdown(st.session_state['page_summ'][file_list[ids]],unsafe_allow_html=True) 
-                # if st.session_state['page_summ']:
-                #     if st.button('Save',type="primary",key='saver'): 
-                #         save_string_as_pdf(st.session_state['page_summ'], "output.pdf")
-
-            with tab3.container(height=1000,border=False):   
+                            col2a, col2b,col2c,col2d, col2e= st.columns(5, gap='small')
+                   
+                            if col2a.button('Edit',type="primary",key=f'editorrr{ids}'): 
+                               container_tab.text_area(label = "", value = st.session_state['page_summ'][file_list[ids]], 
+                                                                                         height = 500, key = f"text_area{ids}")             
+                           
+                            if col2d.button('Save Edit',type="primary",key=f'saver{ids}'):    
+                                if f"text_area{ids}" in st.session_state:
+                                    st.session_state['page_summ'][file_list[ids]] = st.session_state[f"text_area{ids}"]
+                                    save_string_to_s3(st.session_state['page_summ'][file_list[ids]], BUCKET, f"textract_gt/{file_list[ids]}.txt")
+                                    st.rerun()
+                                else:
+                                    st.error("Nothing to save. Make edits before saving")
+                                
+            with tab3.container(height=500,border=False):   
                 if params["session_id"].strip():
                     st.session_state.messages, params['chat_histories']=get_chat_historie_for_streamlit(params)
 
@@ -800,6 +893,39 @@ def page_summary(params):
     else:
         st.session_state['conf'] = ""
         st.session_state['page_summ'] = ""      
+
+
+def save_string_to_s3(string_data, bucket_name, object_key):
+    """
+    Save a string to an S3 bucket.
+
+    Args:
+    string_data (str): The string to save
+    bucket_name (str): The name of the S3 bucket
+    object_key (str): The object key (file path) in the S3 bucket
+
+    Returns:
+    bool: True if successful, False otherwise
+    """
+    # Create an S3 client
+    s3_client = boto3.client('s3')
+
+    try:
+        # Convert string to bytes
+        binary_data = string_data.encode('utf-8')
+
+        # Create a file-like object from the bytes
+        file_obj = io.BytesIO(binary_data)
+
+        # Upload the file to S3
+        s3_client.upload_fileobj(file_obj, bucket_name, object_key)
+
+        st.write(f"Successfully saved string to s3://{bucket_name}/{object_key}")
+        return True
+    except Exception as e:
+        st.error(f"Error saving string to S3: {str(e)}")
+        return False
+
 
 def list_csv_xlsx_in_s3_folder(bucket_name, folder_path):
     """
@@ -844,7 +970,7 @@ def app_sidebar():
         st.metric(label="Bedrock Session Cost", value=f"${round(st.session_state['cost'],2)}") 
         st.metric(label="Textract Session Cost", value=f"${round(textract_pricing(st.session_state['data_pages']),2)}")         
         st.write("-----")       
-        models=[ 'claude-3-5-sonnet','claude-3-sonnet','claude-3-haiku','claude-instant-v1','claude-v2:1', 'claude-v2']
+        models=[ 'claude-3-opus','claude-3-5-sonnet','claude-3-sonnet','claude-3-haiku','claude-instant-v1','claude-v2:1', 'claude-v2']
 
         model=st.selectbox('**Model**', models,)
         params={"model":model}       
