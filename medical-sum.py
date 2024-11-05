@@ -151,16 +151,16 @@ def get_chat_history_db(params,cutoff):
         if "Item" in params['chat_histories']:  
             chat_hist=params['chat_histories']['Item']['messages'][-cutoff:]            
             for d in chat_hist:            
-                current_chat.append({'role': 'user', 'content': [{"type":"text","text":d['user']}]})
-                current_chat.append({'role': 'assistant', 'content': d['assistant']})  
+                current_chat.append({'role': 'user', 'content': [{"text":d['user']}]})
+                current_chat.append({'role': 'assistant', 'content':[{"text":d['assistant']}]})  
         else:
             chat_hist=[]
     else:
         if params['chat_histories']:
             chat_hist = params['chat_histories'][-cutoff:]    
             for d in chat_hist:            
-                    current_chat.append({'role': 'user', 'content': [{"type":"text","text":d['user']}]})
-                    current_chat.append({'role': 'assistant', 'content': d['assistant']})
+                    current_chat.append({'role': 'user', 'content': [{"text":d['user']}]})
+                    current_chat.append({'role': 'assistant', 'content':[{"text":d['assistant']}]})     
         else:
             chat_hist = []
     return current_chat, chat_hist
@@ -207,48 +207,35 @@ def get_session_ids_by_user(table_name, user_id):
 
 
 def bedrock_claude_(params,chat_history,system_message, prompt,model_id,image_path=None, handler=None):
+    chat_history_copy = chat_history[:]
     content=[]
-    if image_path:  
-
+    if image_path:       
         if not isinstance(image_path, list):
             image_path=[image_path]      
         for img in image_path:
-            s3 = boto3.client('s3')
-            match = re.match("s3://(.+?)/(.+)", img)
+            s3 = boto3.client('s3',region_name="us-east-1")
+            match = re.match("s3://(.+?)/(.+)", img)            
             image_name=os.path.basename(img)
             _,ext=os.path.splitext(image_name)
-            if "jpg" in ext: ext=".jpeg"                        
-            if match:
-                bucket_name = match.group(1)
-                key = match.group(2)    
-                obj = s3.get_object(Bucket=bucket_name, Key=key)
-                base_64_encoded_data = base64.b64encode(obj['Body'].read())
-                base64_string = base_64_encoded_data.decode('utf-8')
-            content.extend([{"type":"text","text":image_name},{
-              "type": "image",
-              "source": {
-                "type": "base64",
-                "media_type": f"image/{ext.lower().replace('.','')}",
-                "data": base64_string
+            if "jpg" in ext: ext=".jpeg"           
+            bucket_name = match.group(1)
+            key = match.group(2)    
+            obj = s3.get_object(Bucket=bucket_name, Key=key)
+            bytes_image=obj['Body'].read()            
+            content.extend([{"text":image_name},{
+              "image": {
+                "format": f"{ext.lower().replace('.','')}",
+                "source": {"bytes":bytes_image}
               }
             }])
-    content.append({
-        "type": "text",
+
+    content.append({       
         "text": prompt
             })
-    chat_history.append({"role": "user",
+    chat_history_copy.append({"role": "user",
             "content": content})
-    # print(system_message)
-    prompt = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 2500,
-        "temperature": 0.5,
-        "system":system_message,
-        "messages": chat_history
-    }
-
-    prompt = json.dumps(prompt)
-    response = bedrock_runtime.invoke_model_with_response_stream(body=prompt, modelId=model_id, accept="application/json", contentType="application/json")
+    system_message=[{"text":system_message}]
+    response = bedrock_runtime.converse_stream(messages=chat_history_copy, modelId=model_id,inferenceConfig={"maxTokens": 2000, "temperature": 0.5,},system=system_message)
     answer=bedrock_streemer(params,response, handler) 
     return answer
 
@@ -261,26 +248,22 @@ def textract_pricing(pages):
     
 
 def bedrock_streemer(params,response, handler):
-    stream = response.get('body')
-    answer = ""    
-    if stream:
-        for event in stream:
-            chunk = event.get('chunk')
-            if  chunk:
-                chunk_obj = json.loads(chunk.get('bytes').decode())
-                if "delta" in chunk_obj:                    
-                    delta = chunk_obj['delta']
-                    if "text" in delta:
-                        text=delta['text'] 
-                        # st.write(text, end="")                        
-                        answer+=str(text)       
-                        handler.markdown(answer.replace("$","USD ").replace("%", " percent"))                        
-                if "amazon-bedrock-invocationMetrics" in chunk_obj:
-                    st.session_state['input_token'] = chunk_obj['amazon-bedrock-invocationMetrics']['inputTokenCount']
-                    st.session_state['output_token'] =chunk_obj['amazon-bedrock-invocationMetrics']['outputTokenCount']
-                    pricing=st.session_state['input_token']*pricing_file[f"anthropic.{params['model']}"]["input"]+st.session_state['output_token'] *pricing_file[f"anthropic.{params['model']}"]["output"]
-                    st.session_state['cost']+=pricing             
-    return answer
+    text=''
+    for chunk in response['stream']:       
+
+        if 'contentBlockDelta' in chunk:
+            delta = chunk['contentBlockDelta']['delta']       
+            if 'text' in delta:
+                text += delta['text']               
+                handler.markdown(text.replace("$","USD ").replace("%", " percent"))
+
+        elif "metadata" in chunk:
+            st.session_state['input_token']=chunk['metadata']['usage']["inputTokens"]
+            st.session_state['output_token']=chunk['metadata']['usage']["outputTokens"]
+            latency=chunk['metadata']['metrics']["latencyMs"]
+            pricing=st.session_state['input_token']*pricing_file[f"us.meta.{params['model']}-instruct-v1:0"]["input"]+st.session_state['output_token'] *pricing_file[f"us.meta.{params['model']}-instruct-v1:0"]["output"]
+            st.session_state['cost']+=pricing             
+    return text
 
 def _invoke_bedrock_with_retries(params,current_chat, chat_template, question, model_id, image_path, handler):
     max_retries = 5
@@ -307,14 +290,9 @@ def _invoke_bedrock_with_retries(params,current_chat, chat_template, question, m
 def query_llm(params, handler):
     image_path=[]
     claude3=False
-    model='anthropic.'+params['model']
-    if "sonnet" in model or "haiku" or "opus" in model:
-        model+="-20240620-v1:0" if "claude-3-5" in model else  "-20240307-v1:0" if "haiku" in model else "-20240229-v1:0" if "opus" in model else "-20240229-v1:0"
-        claude3=True
-    # Retrieve past chat history from Dynamodb 
+    model="us.meta."+params['model']+"-instruct-v1:0"
 
     current_chat,chat_hist=get_chat_history_db(params, CHAT_HISTORY_LENGTH)
-
                 
     with open("prompt/chat.txt","r") as f:
         system_template=f.read()
@@ -324,13 +302,16 @@ def query_llm(params, handler):
         prompt=params["prompt"]
         image_path=params["image_path"]
     response=_invoke_bedrock_with_retries(params,current_chat, system_template, prompt, model, image_path, handler)
+       
+    
     chat_history={"user":params['prompt'],
     "assistant":response,
-    "document":params['file_item'],
+    # "document":params['file_item'],
     "modelID":model,
     "time":str(time.time()),
     "input_token":round(st.session_state['input_token']) ,
     "output_token":round(st.session_state['output_token'])} 
+
     #store convsation memory in DynamoDB table
     if DYNAMODB_TABLE:
         put_db(params,chat_history)
@@ -338,31 +319,6 @@ def query_llm(params, handler):
         save_chat_local("chat_history.json",[chat_history])
     return response
     
-def extractor_llm(params, handler):  
-    current_chat=[]
-    image_path=[]
-    claude3=False
-    model='anthropic.'+params['model']
-    if "sonnet" in model or "haiku" in model:
-        model+="-20240229-v1:0" if "sonnet" in model else "-20240307-v1:0"
-        claude3=True
- 
-    with open(f"prompt/{params['domain'].lower()}/system_extraction.txt","r") as f:
-        system_template=f.read()
-    if "doc" in params:
-        with open(f"prompt/{params['domain'].lower()}/extraction.txt","r") as f:
-            prompt=f.read()
-
-        values = {
-        "doc": params['doc'],   
-        }    
-        prompt=prompt.format(**values)
-    elif "image_path" in params:
-        with open(f"prompt/{params['domain'].lower()}/extraction_image.txt","r") as f:
-            prompt=f.read()
-        image_path=params["image_path"]
-    response=_invoke_bedrock_with_retries(params,current_chat, system_template, prompt, model, image_path, handler)    
-    return response
 
 # @st.cache_data
 def process_and_upload_files_to_s3(file, s3_bucket, s3_prefix):
@@ -767,22 +723,6 @@ def page_summary(params):
                     else:
                         st.session_state['gt']= json_cache
                         
-    
-     
-        
-    # elif params['file_item'] and params["processor"] == "Claude3":
-    #     st.session_state['mode']='claude'
-    #     if isinstance(params['file_item'], list):
-    #         doc_list=[]
-    #         if all(isinstance(file, UploadedFile) for file in params['file_item']):
-    #             for file in params['file_item']:
-    #                 pdf_name=file.name
-    #                 pdf_bytes=file.read()
-    #                 item_cache[pdf_name]=pdf_bytes
-    #                 s3.put_object(Bucket=BUCKET, Key=f"{PREFIX}/{pdf_name}", Body=pdf_bytes)
-    #                 doc_list.append(pdf_name) 
-    #             params['file_item']=doc_list
-   
 
     if  item_cache:
         colm1,colm2=st.columns([1,1])
@@ -970,8 +910,7 @@ def app_sidebar():
         st.metric(label="Bedrock Session Cost", value=f"${round(st.session_state['cost'],2)}") 
         st.metric(label="Textract Session Cost", value=f"${round(textract_pricing(st.session_state['data_pages']),2)}")         
         st.write("-----")       
-        models=[ 'claude-3-opus','claude-3-5-sonnet','claude-3-sonnet','claude-3-haiku','claude-instant-v1','claude-v2:1', 'claude-v2']
-
+        models=[ "llama3-2-90b", "llama3-2-11b", "llama3-2-3b","llama3-1-70b", "llama3-1-8b"]        
         model=st.selectbox('**Model**', models,)
         params={"model":model}       
         user_chat_id=get_session_ids_by_user(DYNAMODB_TABLE, st.session_state['userid'])
